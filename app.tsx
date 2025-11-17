@@ -349,12 +349,18 @@ export default function App({
       data: currentPositions,
       getPosition: d => d.position,
       getColor: d => (d.vendor === 0 ? theme.trailColor0 : theme.trailColor1),
-      getIcon: () => ({
-        url: 'https://raw.githubusercontent.com/visgl/deck.gl-data/master/website/icon-marker.png',
-        width: 128,
-        height: 128,
-        anchorY: 128
-      }),
+      getIcon: () => 'marker',
+      iconAtlas: 'https://raw.githubusercontent.com/visgl/deck.gl-data/master/website/icon-atlas.png',
+      iconMapping: {
+        marker: {
+          x: 0,
+          y: 0,
+          width: 128,
+          height: 128,
+          anchorY: 128,
+          mask: true
+        }
+      },
       sizeScale: 20,
       pickable: true
     }),
