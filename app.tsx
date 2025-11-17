@@ -1,20 +1,18 @@
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-import React from "react"
-import {useEffect, useState} from 'react'
-import {createRoot} from 'react-dom/client'
-import {Map} from 'react-map-gl/maplibre'
-import {AmbientLight, Color, LightingEffect, MapViewState, Material, PointLight, Position} from '@deck.gl/core'
-import {DeckGL} from '@deck.gl/react'
-import {PolygonLayer} from '@deck.gl/layers'
-import {MVTLayer} from '@deck.gl/geo-layers'
-import {animate} from 'popmotion'
+import React, { useEffect, useRef, useState } from "react"
+import { createRoot } from 'react-dom/client'
+import { Map as MapGL } from 'react-map-gl/maplibre'
+import { AmbientLight, Color, LightingEffect, MapViewState, Material, PointLight, Position } from '@deck.gl/core'
+import { DeckGL } from '@deck.gl/react'
+import { PolygonLayer } from '@deck.gl/layers'
+import { MVTLayer } from '@deck.gl/geo-layers'
 import IconLayer from './icon-layer/icon-layer'
+import { wsconnect } from "@nats-io/nats-core"
 
-// Source data CSV
+// Source data URL for buildings only
 const DATA_URL = {
   BUILDINGS:
-    'https://raw.githubusercontent.com/visgl/deck.gl-data/master/examples/trips/buildings.json',
-  TRIPS: 'https://raw.githubusercontent.com/visgl/deck.gl-data/master/examples/trips/trips-v7.json'
+    'https://raw.githubusercontent.com/visgl/deck.gl-data/master/examples/trips/buildings.json'
 }
 const MAP_STYLE = 'https://basemaps.cartocdn.com/gl/positron-nolabels-gl-style/style.json'
 
@@ -41,8 +39,8 @@ type Theme = {
 
 const DEFAULT_THEME: Theme = {
   buildingColor: [74, 80, 87],
-  trailColor0: [253, 128, 93],
-  trailColor1: [23, 184, 190],
+  trailColor0: [255, 165, 0],  // Orange for vendor 0
+  trailColor1: [0, 100, 0],     // Dark green for vendor 1
   material: {
     ambient: 0.5,
     diffuse: 0.6,
@@ -74,42 +72,50 @@ type Building = {
   height: number;
 };
 
-type Trip = {
+type PositionMessage = {
+  id: string;
   vendor: number;
-  path: Position[];
-  timestamps: number[];
+  lat: number;
+  lng: number;
+  timestamp: number;
+};
+
+type TripPosition = {
+  position: Position;
+  vendor: number;
+  id: string;
+  timestamp: number;
+};
+
+type AnimatedPosition = TripPosition & {
+  targetPosition?: Position;
+  animationStartTime?: number;
+  animationDuration?: number;
+  previousPosition?: Position;
 };
 
 export default function App({
   buildings = DATA_URL.BUILDINGS,
-  trips = DATA_URL.TRIPS,
   initialViewState = INITIAL_VIEW_STATE,
   mapStyle = MAP_STYLE,
   theme = DEFAULT_THEME,
-  loopLength = 1800, // unit corresponds to the timestamp in source data
-  animationSpeed = 1
+  natsUrl = 'http://nats.hax.journeyman.se:8080'
 }: {
   buildings?: string | Building[];
-  trips?: string | Trip[];
-  loopLength?: number;
-  animationSpeed?: number;
   initialViewState?: MapViewState;
   mapStyle?: string;
   theme?: Theme;
+  natsUrl?: string;
 }) {
-  const [time, setTime] = useState(0)
-  const [tripsData, setTripsData] = useState<Trip[]>([])
   const [buildingsData, setBuildingsData] = useState<Building[]>([])
+  const [tripPositions, setTripPositions] = useState<Map<string, TripPosition[]>>(new Map())
+  const [currentPositions, setCurrentPositions] = useState<TripPosition[]>([])
+  const [animatedPositions, setAnimatedPositions] = useState<Map<string, AnimatedPosition>>(new Map())
+  const natsConnectionRef = useRef<any>(null)
+  const animationFrameRef = useRef<number | null>(null)
 
+  // Load buildings data
   useEffect(() => {
-    if (typeof trips === 'string') {
-      fetch(trips)
-        .then(response => response.json())
-        .then(data => setTripsData(data))
-    } else {
-      setTripsData(trips)
-    }
-
     if (typeof buildings === 'string') {
       fetch(buildings)
         .then(response => response.json())
@@ -117,64 +123,186 @@ export default function App({
     } else {
       setBuildingsData(buildings)
     }
-  }, [trips, buildings])
+  }, [buildings])
 
-  // Calculate current positions for all trips based on current time
-  const getCurrentPositions = () => {
-    return tripsData.map(trip => {
-      const { timestamps, path } = trip
-
-      // Find the current segment based on time
-      let segmentIndex = 0
-      for (let i = 0; i < timestamps.length - 1; i++) {
-        if (time >= timestamps[i] && time <= timestamps[i + 1]) {
-          segmentIndex = i
-          break
-        } else if (time > timestamps[timestamps.length - 1]) {
-          // If time is past the end, use the last position
-          segmentIndex = timestamps.length - 1
-        }
-      }
-
-      // If we're at the last timestamp or beyond, return the last position
-      if (segmentIndex >= timestamps.length - 1) {
-        return {
-          position: path[path.length - 1],
-          vendor: trip.vendor
-        }
-      }
-
-      // Interpolate between two positions
-      const t0 = timestamps[segmentIndex]
-      const t1 = timestamps[segmentIndex + 1]
-      const ratio = (time - t0) / (t1 - t0)
-
-      const p0 = path[segmentIndex]
-      const p1 = path[segmentIndex + 1]
-
-      const interpolatedPosition: Position = [
-        p0[0] + (p1[0] - p0[0]) * ratio,
-        p0[1] + (p1[1] - p0[1]) * ratio,
-        p0[2] !== undefined && p1[2] !== undefined ? p0[2] + (p1[2] - p0[2]) * ratio : 0
-      ]
-
-      return {
-        position: interpolatedPosition,
-        vendor: trip.vendor
-      }
-    })
-  }
-
+  // Connect to NATS and subscribe to positions
   useEffect(() => {
-    const animation = animate({
-      from: 0,
-      to: loopLength,
-      duration: (loopLength * 60) / animationSpeed,
-      repeat: Infinity,
-      onUpdate: setTime
+    const connectToNats = async () => {
+      try {
+        console.log('Connecting to NATS at', natsUrl)
+        const nc = await wsconnect({ servers: natsUrl })
+        natsConnectionRef.current = nc
+        console.log('Connected to NATS')
+
+        // Subscribe to positions subject
+        const sub = nc.subscribe('positions')
+        console.log('Subscribed to positions subject')
+
+          // Process incoming messages
+          ; (async () => {
+            for await (const msg of sub) {
+              try {
+                const positionMsg: PositionMessage = JSON.parse(
+                  new TextDecoder().decode(msg.data)
+                )
+
+                // Update trip positions and animated positions
+                setTripPositions(prev => {
+                  const newMap = new Map(prev)
+                  const tripPositions = newMap.get(positionMsg.id) || []
+
+                  // Add new position to the trip's timeline
+                  const newPosition: TripPosition = {
+                    position: [positionMsg.lng, positionMsg.lat],
+                    vendor: positionMsg.vendor,
+                    id: positionMsg.id,
+                    timestamp: positionMsg.timestamp
+                  }
+
+                  // Keep positions sorted by timestamp
+                  const updatedPositions = [...tripPositions, newPosition].sort(
+                    (a, b) => a.timestamp - b.timestamp
+                  )
+
+                  newMap.set(positionMsg.id, updatedPositions)
+                  return newMap
+                })
+
+                // Update animated positions
+                setAnimatedPositions(prev => {
+                  const newMap = new Map(prev)
+                  const currentAnimated = newMap.get(positionMsg.id)
+
+                  // Calculate animation duration based on time elapsed since last position
+                  let animationDuration = 1000 // Default 1 second
+
+                  // Get the previous position from the animated state if it exists
+                  if (currentAnimated && currentAnimated.timestamp) {
+                    // Use the actual time difference between positions
+                    animationDuration = positionMsg.timestamp - currentAnimated.timestamp
+                    // Cap the animation duration to reasonable limits (100ms to 5 seconds)
+                    animationDuration = Math.max(100, Math.min(5000, animationDuration))
+                  }
+
+                  const newAnimatedPosition: AnimatedPosition = {
+                    position: currentAnimated?.position || [positionMsg.lng, positionMsg.lat],
+                    vendor: positionMsg.vendor,
+                    id: positionMsg.id,
+                    timestamp: positionMsg.timestamp,
+                    targetPosition: [positionMsg.lng, positionMsg.lat],
+                    animationStartTime: Date.now(),
+                    animationDuration: animationDuration,
+                    previousPosition: currentAnimated?.position
+                  }
+
+                  newMap.set(positionMsg.id, newAnimatedPosition)
+                  return newMap
+                })
+              } catch (err) {
+                console.error('Error processing position message:', err)
+              }
+            }
+          })().then()
+      } catch (err) {
+        console.error('Error connecting to NATS:', err)
+      }
+    }
+
+    connectToNats()
+
+    // Cleanup on unmount
+    return () => {
+      if (natsConnectionRef.current) {
+        natsConnectionRef.current.close()
+      }
+    }
+  }, [natsUrl])
+
+  // Animation loop for smooth position transitions
+  useEffect(() => {
+    const animate = () => {
+      const now = Date.now()
+      let needsUpdate = false
+
+      setAnimatedPositions(prev => {
+        const newMap = new Map(prev)
+
+        prev.forEach((animatedPos, tripId) => {
+          if (animatedPos.targetPosition && animatedPos.animationStartTime && animatedPos.animationDuration) {
+            const elapsed = now - animatedPos.animationStartTime
+            const progress = Math.min(1, elapsed / animatedPos.animationDuration)
+
+            if (progress < 1) {
+              needsUpdate = true
+
+              // Linear interpolation between previous and target position
+              const fromPos = animatedPos.previousPosition || animatedPos.position
+              const toPos = animatedPos.targetPosition
+
+              const interpolatedPosition: Position = [
+                fromPos[0] + (toPos[0] - fromPos[0]) * progress,
+                fromPos[1] + (toPos[1] - fromPos[1]) * progress
+              ]
+
+              newMap.set(tripId, {
+                ...animatedPos,
+                position: interpolatedPosition
+              })
+            } else {
+              // Animation complete, set to final position
+              newMap.set(tripId, {
+                ...animatedPos,
+                position: animatedPos.targetPosition,
+                previousPosition: animatedPos.targetPosition,
+                targetPosition: undefined,
+                animationStartTime: undefined,
+                animationDuration: undefined
+              })
+            }
+          }
+        })
+
+        return newMap
+      })
+
+      if (needsUpdate) {
+        animationFrameRef.current = requestAnimationFrame(animate)
+      } else {
+        animationFrameRef.current = null
+      }
+    }
+
+    // Start animation if there are animated positions
+    if (animatedPositions.size > 0) {
+      if (!animationFrameRef.current) {
+        animationFrameRef.current = requestAnimationFrame(animate)
+      }
+    }
+
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current)
+        animationFrameRef.current = null
+      }
+    }
+  }, [animatedPositions])
+
+  // Update current positions from animated positions
+  useEffect(() => {
+    const positions: TripPosition[] = []
+
+    animatedPositions.forEach((animatedPos) => {
+      positions.push({
+        position: animatedPos.position,
+        vendor: animatedPos.vendor,
+        id: animatedPos.id,
+        timestamp: animatedPos.timestamp
+      })
     })
-    return () => animation.stop()
-  }, [loopLength, animationSpeed])
+
+    setCurrentPositions(positions)
+  }, [animatedPositions])
+
 
   const layers = [
     new MVTLayer({
@@ -218,7 +346,7 @@ export default function App({
     }),
     new IconLayer({
       id: 'trip-icons',
-      data: getCurrentPositions(),
+      data: currentPositions,
       getPosition: d => d.position,
       getColor: d => (d.vendor === 0 ? theme.trailColor0 : theme.trailColor1),
       getIcon: () => ({
@@ -227,7 +355,7 @@ export default function App({
         height: 128,
         anchorY: 128
       }),
-      sizeScale: 8,
+      sizeScale: 20,
       pickable: true
     }),
     new PolygonLayer<Building>({
@@ -250,7 +378,7 @@ export default function App({
       initialViewState={initialViewState}
       controller={true}
     >
-      <Map reuseMaps mapStyle={mapStyle} />
+      <MapGL reuseMaps mapStyle={mapStyle} />
     </DeckGL>
   )
 }
