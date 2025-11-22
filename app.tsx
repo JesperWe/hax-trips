@@ -85,6 +85,7 @@ type TripPosition = {
   vendor: number;
   id: string;
   timestamp: number;
+  receivedAt: Date;
 };
 
 type AnimatedPosition = TripPosition & {
@@ -108,7 +109,6 @@ export default function App({
   natsUrl?: string;
 }) {
   const [buildingsData, setBuildingsData] = useState<Building[]>([])
-  const [tripPositions, setTripPositions] = useState<Map<string, TripPosition[]>>(new Map())
   const [currentPositions, setCurrentPositions] = useState<TripPosition[]>([])
   const [animatedPositions, setAnimatedPositions] = useState<Map<string, AnimatedPosition>>(new Map())
   const natsConnectionRef = useRef<any>(null)
@@ -138,35 +138,15 @@ export default function App({
         const sub = nc.subscribe('positions')
         console.log('Subscribed to positions subject')
 
-          // Process incoming messages
-          ; (async () => {
-            for await (const msg of sub) {
-              try {
+
+        // Process incoming messages
+        ; (async () => {
+          for await (const msg of sub) {
+            try {
+                const now = new Date()
                 const positionMsg: PositionMessage = JSON.parse(
                   new TextDecoder().decode(msg.data)
                 )
-
-                // Update trip positions and animated positions
-                setTripPositions(prev => {
-                  const newMap = new Map(prev)
-                  const tripPositions = newMap.get(positionMsg.id) || []
-
-                  // Add new position to the trip's timeline
-                  const newPosition: TripPosition = {
-                    position: [positionMsg.lng, positionMsg.lat],
-                    vendor: positionMsg.vendor,
-                    id: positionMsg.id,
-                    timestamp: positionMsg.timestamp
-                  }
-
-                  // Keep positions sorted by timestamp
-                  const updatedPositions = [...tripPositions, newPosition].sort(
-                    (a, b) => a.timestamp - b.timestamp
-                  )
-
-                  newMap.set(positionMsg.id, updatedPositions)
-                  return newMap
-                })
 
                 // Update animated positions
                 setAnimatedPositions(prev => {
@@ -192,7 +172,8 @@ export default function App({
                     targetPosition: [positionMsg.lng, positionMsg.lat],
                     animationStartTime: Date.now(),
                     animationDuration: animationDuration,
-                    previousPosition: currentAnimated?.position
+                    previousPosition: currentAnimated?.position,
+                    receivedAt: now
                   }
 
                   newMap.set(positionMsg.id, newAnimatedPosition)
@@ -296,12 +277,32 @@ export default function App({
         position: animatedPos.position,
         vendor: animatedPos.vendor,
         id: animatedPos.id,
-        timestamp: animatedPos.timestamp
+        timestamp: animatedPos.timestamp,
+        receivedAt: animatedPos.receivedAt
       })
     })
 
     setCurrentPositions(positions)
   }, [animatedPositions])
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = Date.now()
+      setAnimatedPositions(prev => {
+        const next = new Map(prev)
+        let deleted = false
+        prev.forEach((animatedPos, tripId) => {
+          if (now - animatedPos.receivedAt.getTime() > 1_000) {
+            next.delete(tripId)
+            deleted = true
+          }
+        })
+        return deleted ? next : prev
+      })
+    }, 100)
+
+    return () => clearInterval(interval)
+  }, [])
 
 
   const layers = [
