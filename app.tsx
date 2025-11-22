@@ -85,7 +85,6 @@ type TripPosition = {
   vendor: number;
   id: string;
   timestamp: number;
-  receivedAt: Date;
 };
 
 type AnimatedPosition = TripPosition & {
@@ -139,8 +138,6 @@ export default function App({
         const sub = nc.subscribe('positions')
         console.log('Subscribed to positions subject')
 
-        const now = new Date()
-
           // Process incoming messages
           ; (async () => {
             for await (const msg of sub) {
@@ -159,8 +156,7 @@ export default function App({
                     position: [positionMsg.lng, positionMsg.lat],
                     vendor: positionMsg.vendor,
                     id: positionMsg.id,
-                    timestamp: positionMsg.timestamp,
-                    receivedAt: now
+                    timestamp: positionMsg.timestamp
                   }
 
                   // Keep positions sorted by timestamp
@@ -196,8 +192,7 @@ export default function App({
                     targetPosition: [positionMsg.lng, positionMsg.lat],
                     animationStartTime: Date.now(),
                     animationDuration: animationDuration,
-                    previousPosition: currentAnimated?.position,
-                    receivedAt: now
+                    previousPosition: currentAnimated?.position
                   }
 
                   newMap.set(positionMsg.id, newAnimatedPosition)
@@ -301,45 +296,12 @@ export default function App({
         position: animatedPos.position,
         vendor: animatedPos.vendor,
         id: animatedPos.id,
-        timestamp: animatedPos.timestamp,
-        receivedAt: animatedPos.receivedAt
+        timestamp: animatedPos.timestamp
       })
     })
 
     setCurrentPositions(positions)
   }, [animatedPositions])
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const now = Date.now()
-
-      setTripPositions(prev => {
-        const next = new Map(prev)
-
-        prev.forEach((tripPositions, tripId) => {
-          if (now - tripPositions[0].receivedAt.getTime() > 1_000) {
-            next.delete(tripId)
-          }
-        })
-
-        return next
-      })
-
-      setAnimatedPositions(prev => {
-        const next = new Map(prev)
-
-        prev.forEach((animatedPos, tripId) => {
-          if (now - animatedPos.receivedAt.getTime() > 1_000) {
-            next.delete(tripId)
-          }
-        })
-
-        return next
-      })
-    }, 1000)
-
-    return () => clearInterval(interval)
-  }, [])
 
 
   const layers = [
