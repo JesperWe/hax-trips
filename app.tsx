@@ -99,7 +99,7 @@ export default function App({
   initialViewState = INITIAL_VIEW_STATE,
   mapStyle = MAP_STYLE,
   theme = DEFAULT_THEME,
-  natsUrl = 'http://nats.hax.journeyman.se:8080'
+  natsUrl = 'https://nats.hax.journeyman.se'
 }: {
   buildings?: string | Building[];
   initialViewState?: MapViewState;
